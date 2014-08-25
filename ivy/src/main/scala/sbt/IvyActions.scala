@@ -15,6 +15,7 @@ import org.apache.ivy.core.module.descriptor.{ Artifact => IArtifact, MDArtifact
 import org.apache.ivy.core.report.ResolveReport
 import org.apache.ivy.core.resolve.ResolveOptions
 import org.apache.ivy.plugins.resolver.{ BasicResolver, DependencyResolver }
+import cablecar.CustomResolution
 
 final class DeliverConfiguration(val deliverIvyPattern: String, val status: String, val configurations: Option[Seq[Configuration]], val logging: UpdateLogging.Value)
 final class PublishConfiguration(val ivyFile: Option[File], val resolverName: String, val artifacts: Map[Artifact, File], val checksums: Seq[String], val logging: UpdateLogging.Value,
@@ -154,6 +155,19 @@ object IvyActions {
   def updateEither(module: IvySbt#Module, configuration: UpdateConfiguration,
     uwconfig: UnresolvedWarningConfiguration, log: Logger): Either[UnresolvedWarning, UpdateReport] =
     module.withModule(log) {
+      case (ivy, md, default) if module.owner.configuration.updateOptions.customResolution =>
+        ivy match {
+          case x: CustomResolution =>
+            val resolveOptions = new ResolveOptions
+            val resolveId = ResolveOptions.getDefaultResolveId(md)
+            resolveOptions.setResolveId(resolveId)
+            // resolveOptions.setLog(ivyLogLevel(logging))
+            val uReport = x.customResolve(md, resolveOptions, log)
+            configuration.retrieve match {
+              case Some(rConf) => Right(retrieve(ivy, uReport, rConf))
+              case None        => Right(uReport)
+            }
+        }
       case (ivy, md, default) =>
         val (report, err) = resolve(configuration.logging)(ivy, md, default)
         err match {
