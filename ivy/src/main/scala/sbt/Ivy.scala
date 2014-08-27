@@ -5,7 +5,7 @@ package sbt
 
 import Resolver.PluginPattern
 import ivyint.{ ConsolidatedResolveEngine, ConsolidatedResolveCache }
-import cablecar.{ CustomResolution, ModuleDescriptorCache }
+import cablecar.{ CustomResolution, ModuleDescriptorCache, ExcludeRuleCache }
 
 import java.io.File
 import java.net.URI
@@ -88,6 +88,7 @@ final class IvySbt(val configuration: IvyConfiguration) {
     {
       val i = new Ivy() with CustomResolution {
         override val mdCache = IvySbt.moduleDescriptorCache
+        override val erCache = IvySbt.excludeRuleCache
         private val loggerEngine = new SbtMessageLoggerEngine
         override def getLoggerEngine = loggerEngine
         override def bind(): Unit = {
@@ -245,6 +246,7 @@ private object IvySbt {
   val DefaultChecksums = Seq("sha1", "md5")
   private[sbt] val consolidatedResolveCache: ConsolidatedResolveCache = new ConsolidatedResolveCache()
   private[sbt] val moduleDescriptorCache: ModuleDescriptorCache = new ModuleDescriptorCache()
+  private[sbt] val excludeRuleCache: ExcludeRuleCache = new ExcludeRuleCache()
 
   def defaultIvyFile(project: File) = new File(project, DefaultIvyFilename)
   def defaultIvyConfiguration(project: File) = new File(project, DefaultIvyConfigFilename)
