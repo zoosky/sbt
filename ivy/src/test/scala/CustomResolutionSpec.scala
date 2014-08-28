@@ -14,12 +14,16 @@ class CustomResolutionSpec extends BaseIvySpecification {
 
   Exclusion rules should
     exclude                                                     $e2
+
+  Conflicts should
+    be resolved                                                 $e3
                                                                 """
 
   def commonsIo13 = ModuleID("commons-io", "commons-io", "1.3", Some("compile"))
   def commonsIo13Test = ModuleID("commons-io", "commons-io", "1.3", Some("test->test"))
   def unfilteredUploads080 = ModuleID("net.databinder", "unfiltered-uploads", "0.8.0", Some("compile")) cross CrossVersion.binary
   def unfilteredUploads080Ex = unfilteredUploads080 exclude ("commons-io", "commons-io")
+  def commonsIo14 = ModuleID("commons-io", "commons-io", "1.4", Some("compile"))
 
   def customResolution = true
 
@@ -38,6 +42,14 @@ class CustomResolutionSpec extends BaseIvySpecification {
     val fileNames = report.allFiles map { _.getName }
     println(fileNames)
     fileNames must not contain ("commons-io-1.4.jar")
-    // report.configurations.size must_== 3
+  }
+
+  def e3 = {
+    log.setLevel(Level.Debug)
+    val m = module(defaultModuleId, Seq(commonsIo13, unfilteredUploads080), Some("2.10.3"), UpdateOptions().withCustomResolution(customResolution))
+    val report = ivyUpdate(m)
+    val fileNames = report.allFiles map { _.getName }
+    println(fileNames)
+    fileNames must not contain ("commons-io-1.3.jar")
   }
 }

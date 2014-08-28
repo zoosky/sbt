@@ -39,12 +39,10 @@ private[sbt] trait CustomResolution { self: Ivy =>
       val ivyData = new IvyResolveData(self.getResolveEngine, options0)
       context.setResolveData(ivyData)
       val data0 = ResolveData(ivyData, mdCache, erCache, self.getResolveEngine.getSettings, log)
-      val (data1, deps0) = buildDependencies(md0, options0, data0)
-      // This is expensive to build, so build once and pass it along
-      val bl = data1.buildBacklists
-      val deps = data1.excludeCompletelyExcludedNodes(deps0, bl)
+      val (data1, deps0, bl) = buildDependencies(md0, options0, data0)
+      val deps = data1.excludeCompletelyEvictedNodes(deps0, bl)
       val data2 = data1.downloadArtifacts(deps, options0.getArtifactFilter, new DownloadOptions(), bl)
-      data2.buildUpdateReport(deps)
+      data2.buildUpdateReport(deps0)
     } finally {
       context.setResolveData(None.orNull)
     }
@@ -52,7 +50,7 @@ private[sbt] trait CustomResolution { self: Ivy =>
 
   // 1.
   /** ResolveEngine#getDependencies */
-  def buildDependencies(md0: ModuleDescriptor, options0: ResolveOptions, data0: ResolveData): (ResolveData, Vector[CablecarNode]) = {
+  def buildDependencies(md0: ModuleDescriptor, options0: ResolveOptions, data0: ResolveData): (ResolveData, Vector[CablecarNode], BlackList) = {
     val log = data0.log
     val rootConfigurations = options0.getConfs(md0).toVector
     val missingConfs: Vector[String] =
@@ -74,7 +72,12 @@ private[sbt] trait CustomResolution { self: Ivy =>
       data1 = data1.fetchDependencies(root, conf, false)
       data1 = data1.clearAllConfsToFetch()
     }
-    (data1, data1.sortDependencies.toVector)
+    // This is expensive to build, so build once and pass it along
+    val bl0 = data1.buildBacklists
+    val rawNodes = data1.nodes.values.toVector
+    val deps0 = data1.excludeCompletelyExcludedNodes(rawNodes, bl0)
+    val bl = data1.resolveConflicts(deps0, bl0)
+    (data1, data1.sortDependencies(deps0), bl)
   }
 
   def plural(singular: String, size: Int): String =
@@ -104,7 +107,6 @@ private[sbt] case class ResolveData(
     artifacts: Map[CablecarNode, Seq[IvyArtifact]] = Map(),
     artifactDownloadReports: Map[CablecarNode, Seq[ArtifactDownloadReport]] = Map()) {
   val FallBackConfPattern = """(.+)\((.*)\)""".r
-  import CablecarNode.Blacklists
 
   def mkCablecarNode(md: ModuleDescriptor): (CablecarNode, ResolveData) =
     {
@@ -345,12 +347,11 @@ private[sbt] case class ResolveData(
       val usage = usages.getOrElse(node, CablecarNodeUsage())
       usage.requiredConfs.getOrElse(parent -> inConfig, Set())
     }
-  def sortDependencies: Seq[CablecarNode] =
+  def sortDependencies(deps0: Vector[CablecarNode]): Vector[CablecarNode] =
     {
-      val xs = nodes.values.toVector
-      val nulls = xs filter { x => moduleDescriptor(x).isEmpty }
+      val nulls = deps0 filter { x => moduleDescriptor(x).isEmpty }
       val reverseMap: mutable.Map[ModuleDescriptor, Vector[CablecarNode]] = mutable.Map()
-      xs foreach { node =>
+      deps0 foreach { node =>
         moduleDescriptor(node) map { md =>
           val nodes0 = reverseMap.getOrElseUpdate(md, Vector())
           reverseMap(md) = nodes0 :+ node
@@ -358,10 +359,10 @@ private[sbt] case class ResolveData(
       }
       import collection.JavaConversions._
       val mdList = ivyData.getEngine.getSortEngine.sortModuleDescriptors(reverseMap.keys.toList, SortOptions.SILENT).toList
-      (mdList flatMap { case md: ModuleDescriptor => reverseMap(md) }) ++ nulls
+      (mdList flatMap { case md: ModuleDescriptor => reverseMap(md) }).toVector ++ nulls
     }
 
-  def downloadArtifacts(deps: Vector[CablecarNode], artifactFilter: IvyFilter, downloadOptions: DownloadOptions, blacklists: Blacklists): ResolveData =
+  def downloadArtifacts(deps: Vector[CablecarNode], artifactFilter: IvyFilter, downloadOptions: DownloadOptions, blacklists: BlackList): ResolveData =
     {
       var data = this
       deps foreach { node =>
@@ -381,8 +382,8 @@ private[sbt] case class ResolveData(
       data
     }
   // TODO filter out evicted configurations
-  def selectedArtifacts(node: CablecarNode, filter: IvyFilter, backlists: Blacklists): Vector[IvyArtifact] =
-    (((backlists get node) match {
+  def selectedArtifacts(node: CablecarNode, filter: IvyFilter, backlists: BlackList): Vector[IvyArtifact] =
+    (((backlists.excludedRootConfs get node) match {
       case Some(blackList) => nodeRootModuleConfs(node) diff blackList
       case _               => nodeRootModuleConfs(node)
     }).toVector.sorted flatMap { rootModuleConf =>
@@ -438,13 +439,14 @@ private[sbt] case class ResolveData(
 
   // Cached mapping between a node and rootModuleConf, in which the node is excluded
   // Since this is going to be expensive, be careful calling this on different data
-  def buildBacklists: Blacklists =
+  def buildBacklists: BlackList =
     {
+      log.debug("constructing blacklist")
       val allNodes = nodes.values.toVector
       val nodeToExcludedRootConfigs: mutable.Map[CablecarNode, Set[String]] = mutable.Map()
       rootConfigurations map { rootModuleConf =>
         val rules = cachedExcludeRules(rootModuleConf)
-        // TODO: cache these nodes
+        // TODO: cache these nodes?
         val ns = allNodes filter { isNodeInRootModuleConf(_, rootModuleConf) }
         val excludedNodes = ns filter { node => rules.exists(isNodeExcluded(_, node)) }
         excludedNodes foreach { node =>
@@ -452,24 +454,25 @@ private[sbt] case class ResolveData(
           nodeToExcludedRootConfigs(node) = (confs + rootModuleConf)
         }
       }
-      nodeToExcludedRootConfigs.toMap
+      BlackList(nodeToExcludedRootConfigs.toMap, Map())
     }
-  def completelyExcludedNodes(blacklists: Blacklists): Set[CablecarNode] =
+  def completelyExcludedNodes(blacklist: BlackList): Set[CablecarNode] =
     {
-      val retval = (blacklists.toSeq.toVector flatMap {
+      val retval = (blacklist.excludedRootConfs.toSeq.toVector flatMap {
         case (node, excludedRootConfs) =>
           val includedRootConfs = nodeRootModuleConfs(node)
           if ((includedRootConfs diff excludedRootConfs).isEmpty) Vector(node)
           else Vector()
-      }).toSet
-      log.debug(s"++ completely excluded: $retval")
-      retval
+      })
+      log.debug("- completely excluded nodes: " + (retval map { _.mrid }).mkString(", "))
+      retval.toSet
     }
-  def excludeCompletelyExcludedNodes(deps: Vector[CablecarNode], blacklists: Blacklists): Vector[CablecarNode] =
+  def excludeCompletelyExcludedNodes(deps: Vector[CablecarNode], blacklist: BlackList): Vector[CablecarNode] =
     {
-      val compEx = completelyExcludedNodes(blacklists)
+      val compEx = completelyExcludedNodes(blacklist)
       deps filter { node => !compEx(node) }
     }
+  // TODO: Check if caching is worth it.
   def isNodeExcluded(rule: ExcludeRule, node: CablecarNode): Boolean =
     erCache.isNodeExcluded(rule, node)
   // isArtifactExcluded(rule, DefaultArtifact.newIvyArtifact(node.mrid, None.orNull).getId.getArtifactId)
@@ -477,6 +480,60 @@ private[sbt] case class ResolveData(
   // def isArtifactExcluded(rule: ExcludeRule, artifactId: IvyArtifactId): Boolean =
   //   MatcherHelper.matches(rule.getMatcher, rule.getId, artifactId)
 
+  def completelyEvictedNodes(blacklist: BlackList): Set[CablecarNode] =
+    {
+      val evictedRootModuleConfs: mutable.Map[CablecarNode, Set[String]] = mutable.Map()
+      blacklist.evictions foreach {
+        case ((rootModuleConf, org, name), EvictionEntry(_, _, evicted)) =>
+          evicted foreach { node =>
+            val confs = evictedRootModuleConfs.getOrElse(node, Set())
+            evictedRootModuleConfs(node) = (confs + rootModuleConf)
+          }
+      }
+      val retval = (evictedRootModuleConfs.toSeq.toVector flatMap {
+        case (node, evictedRootConfs) =>
+          val includedRootConfs = nodeRootModuleConfs(node)
+          if ((includedRootConfs diff evictedRootConfs).isEmpty) Vector(node)
+          else Vector()
+      })
+      log.debug("- completely evicted nodes: " + (retval map { _.mrid }).mkString(", "))
+      retval.toSet
+    }
+
+  def excludeCompletelyEvictedNodes(deps: Vector[CablecarNode], blacklist: BlackList): Vector[CablecarNode] =
+    {
+      val compEv = completelyEvictedNodes(blacklist)
+      deps filter { node => !compEv(node) }
+    }
+
+  // expect deps0 to have all completely excluded modules filtered out.
+  def resolveConflicts(deps0: Vector[CablecarNode], bl0: BlackList): BlackList =
+    {
+      val errs: mutable.ListBuffer[Exception] = mutable.ListBuffer()
+      val evictions: mutable.Map[(String, String, String), EvictionEntry] = mutable.Map()
+      // evaluate conflicts independently for each rootModuleConfs
+      rootConfigurations map { rootModuleConf =>
+        val ns = deps0 filter { isNodeInRootModuleConf(_, rootModuleConf) }
+        val conflicts = (ns groupBy { node =>
+          val mrid = node.mrid
+          (mrid.getOrganisation, mrid.getName)
+        }).toVector filter { case (k, v) => v.size > 1 }
+        conflicts map {
+          case ((org, name), vs) =>
+            log.debug(s"- conflict in $rootModuleConf:$org:$name " + (vs map { _.mrid }).mkString("(", ", ", ")"))
+            val conflictManager = settings.getConflictManager(vs.head.mrid.getModuleId)
+            ConflictManager.resolveConflicts(rootModuleConf, org, name, vs, conflictManager, dds, mds) match {
+              case Right(entry) => evictions((rootModuleConf, org, name)) = entry
+              case Left(err)    => errs += err
+            }
+        }
+      }
+      if (!errs.isEmpty) {
+        sys.error((errs.toList map { _.getMessage }).mkString("\n"))
+      }
+      bl0.copy(evictions = evictions.toMap)
+    }
+  // deps excludes completley excluded modules, but includes completely evicted modules.
   def buildUpdateReport(deps: Vector[CablecarNode]): UpdateReport =
     {
       new UpdateReport(new File(""), rootConfigurations map { conf => buildConfigurationReport(conf, deps) },
@@ -724,8 +781,5 @@ private[sbt] case class CablecarNode(mrid: ModuleRevisionId, rootOpt: Option[Cab
   def isCompletelyEvicted = false
 }
 
-private[sbt] object CablecarNode {
-  type Blacklists = Map[CablecarNode, Set[String]]
-  // def apply(md: ModuleDescriptor): CablecarNode = CablecarNode(md.getModuleRevisionId, Some(md), None)
-  // def apply(parent: CablecarNode, dd: DependencyDescriptor): CablecarNode = CablecarNode(dd.getDependencyRevisionId, None, Some(parent.root))
-}
+private[sbt] case class BlackList(excludedRootConfs: Map[CablecarNode, Set[String]],
+  evictions: Map[(String, String, String), EvictionEntry])
